@@ -6,7 +6,47 @@ import time
 import argparse
 import logging
 import shutil
+import sys
 import zipfile
+
+
+def _file_stream_positions(files):
+    if not files:
+        return []
+    values = files.values() if hasattr(files, "values") else (item[1] for item in files)
+    positions = []
+    for value in values:
+        stream = value[1] if isinstance(value, tuple) and len(value) > 1 else value
+        if hasattr(stream, "tell") and hasattr(stream, "seek"):
+            try:
+                positions.append((stream, stream.tell()))
+            except (OSError, ValueError):
+                pass
+    return positions
+
+
+def _with_simple_retries(fn, max_attempts=8, sleep_secs=1.0):
+    def _wrapper(*args, **kwargs):
+        file_positions = _file_stream_positions(kwargs.get("files"))
+        for i in range(max_attempts):
+            try:
+                if i:
+                    for stream, position in file_positions:
+                        stream.seek(position)
+                return fn(*args, **kwargs)
+            except Exception as e:
+                logging.warning(f"{fn.__name__} attempt {i+1}/{max_attempts} failed: {e}")
+                if i == max_attempts - 1:
+                    raise
+                time.sleep(sleep_secs)
+    return _wrapper
+
+
+HTTP_RETRY_MAX_TRIES = int(os.getenv("HTTP_RETRY_MAX_TRIES") or "8")
+HTTP_RETRY_SLEEP_SECS = float(os.getenv("HTTP_RETRY_SLEEP_SECS") or "1")
+
+requests.get = _with_simple_retries(requests.get, max_attempts=HTTP_RETRY_MAX_TRIES, sleep_secs=HTTP_RETRY_SLEEP_SECS)
+requests.post = _with_simple_retries(requests.post, max_attempts=HTTP_RETRY_MAX_TRIES, sleep_secs=HTTP_RETRY_SLEEP_SECS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,17 +63,21 @@ SECRET_KEY = os.getenv("SECRET_KEY") or "worldpeace2024"
 # The headers for API requests
 HEADERS = {"Authorization": f"Bearer {SECRET_KEY}"}
 
-TIMEOUT = int(os.getenv("TIMEOUT") or "30")
+SIGN_TIMEOUT = int(os.getenv("SIGN_TIMEOUT") or "100")
+TIMEOUT = float(os.getenv("TIMEOUT") or "900")
 
 
 def create(task_name, file_path=None):
     if file_path is None:
-        response = requests.post(f"{BASE_URL}/tasks/{task_name}", headers=HEADERS)
+        response = requests.post(
+            f"{BASE_URL}/tasks/{task_name}", timeout=TIMEOUT, headers=HEADERS
+        )
     else:
         with open(file_path, "rb") as f:
             files = {"file": f}
             response = requests.post(
                 f"{BASE_URL}/tasks/{task_name}",
+                timeout=TIMEOUT,
                 headers=HEADERS,
                 files=files,
             )
@@ -44,19 +88,27 @@ def upload_file(task_id, file_path):
     with open(file_path, "rb") as f:
         files = {"file": f}
         response = requests.post(
-            f"{BASE_URL}/tasks/{task_id}/files", headers=HEADERS, files=files
+            f"{BASE_URL}/tasks/{task_id}/files",
+            timeout=TIMEOUT,
+            headers=HEADERS,
+            files=files,
         )
     return get_json(response)
 
 
 def get_status(task_id):
-    response = requests.get(f"{BASE_URL}/tasks/{task_id}/status", headers=HEADERS)
+    response = requests.get(
+        f"{BASE_URL}/tasks/{task_id}/status", timeout=TIMEOUT, headers=HEADERS
+    )
     return get_json(response)
 
 
 def download_files(task_id, output_dir, fn=None):
     response = requests.get(
-        f"{BASE_URL}/tasks/{task_id}/files", headers=HEADERS, stream=True
+        f"{BASE_URL}/tasks/{task_id}/files",
+        timeout=TIMEOUT,
+        headers=HEADERS,
+        stream=True,
     )
 
     # Check if the request was successful
@@ -73,7 +125,10 @@ def download_files(task_id, output_dir, fn=None):
 
 def download_one_file(task_id, file_id, output_dir):
     response = requests.get(
-        f"{BASE_URL}/tasks/{task_id}/files/{file_id}", headers=HEADERS, stream=True
+        f"{BASE_URL}/tasks/{task_id}/files/{file_id}",
+        timeout=TIMEOUT,
+        headers=HEADERS,
+        stream=True,
     )
 
     # Check if the request was successful
@@ -86,14 +141,19 @@ def download_one_file(task_id, file_id, output_dir):
     return response.ok
 
 
-def fetch():
-    response = requests.get(f"{BASE_URL}/tasks/fetch_task", headers=HEADERS)
+def fetch(tag=None):
+    response = requests.get(
+        f"{BASE_URL}/tasks/fetch_task" + ("?tag=%s" % tag if tag else ""),
+        timeout=TIMEOUT,
+        headers=HEADERS,
+    )
     return get_json(response)
 
 
 def update_status(task_id, status):
     response = requests.patch(
         f"{BASE_URL}/tasks/{task_id}/status",
+        timeout=TIMEOUT,
         headers=HEADERS,
         json=status,
     )
@@ -103,6 +163,7 @@ def update_status(task_id, status):
 def delete_task(task_id):
     response = requests.delete(
         f"{BASE_URL}/tasks/{task_id}",
+        timeout=TIMEOUT,
         headers=HEADERS,
     )
     return get_json(response)
@@ -134,19 +195,29 @@ def sign_one_file(file_path):
     logging.info(f"Uploaded {file_path}")
     task_id = res["id"]
     n = 0
+    status = {}
     while True:
-        if n >= TIMEOUT:
+        if n >= SIGN_TIMEOUT:
+            logging.error(
+                "Timed out waiting to sign %s after %s polls "
+                "(task_id=%s, state=%s, fetched_at=%s)",
+                file_path, n, task_id,
+                status.get("state") if status else None,
+                status.get("fetched_at") if status else None,
+            )
             delete_task(task_id)
-            logging.error(f"Failed to sign {file_path}")
             break
         time.sleep(6)
         n += 1
         status = get_status(task_id)
         if status and status.get("state") == "done":
-            download_one_file(
+            downloaded = download_one_file(
                 task_id, os.path.basename(file_path), os.path.dirname(file_path)
             )
             delete_task(task_id)
+            if not downloaded:
+                logging.error(f"Failed to download signed {file_path}")
+                return False
             logging.info(f"Signed {file_path}")
             return True
     return False
@@ -184,15 +255,19 @@ def sign_files(dir_path, only_ext=None):
             if not only_ext[i].startswith("."):
                 only_ext[i] = "." + only_ext[i]
     for root, dirs, files in os.walk(dir_path):
+        is_signed_dir = "RustDeskPrinterDriver" in root or "usbmmidd_v2" in root
         for file in files:
             file_path = os.path.join(root, file)
             _, ext = os.path.splitext(file_path)
+            # only sign the exe files in signed dirs
+            if is_signed_dir and ext not in [".exe"]:
+                continue
             if only_ext and ext not in only_ext:
                 continue
             if ext in SIGN_EXTENSIONS:
                 if not sign_one_file(file_path):
                     logging.error(f"Failed to sign {file_path}")
-                    break
+                    sys.exit(1)
 
 
 def main():

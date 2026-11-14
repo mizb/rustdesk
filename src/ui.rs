@@ -12,7 +12,7 @@ use hbb_common::{
     log,
 };
 
-#[cfg(not(any(feature = "flutter", feature = "cli")))]
+#[cfg(not(feature = "flutter"))]
 use crate::ui_session_interface::Session;
 use crate::{common::get_app_name, ipc, ui_interface::*};
 
@@ -29,7 +29,7 @@ lazy_static::lazy_static! {
     static ref STUPID_VALUES: Mutex<Vec<Arc<Vec<Value>>>> = Default::default();
 }
 
-#[cfg(not(any(feature = "flutter", feature = "cli")))]
+#[cfg(not(feature = "flutter"))]
 lazy_static::lazy_static! {
     pub static ref CUR_SESSION: Arc<Mutex<Option<Session<remote::SciterHandler>>>> = Default::default();
 }
@@ -41,15 +41,23 @@ pub fn start(args: &mut [String]) {
     crate::platform::delegate::show_dock();
     #[cfg(all(target_os = "linux", feature = "inline"))]
     {
-        #[cfg(feature = "appimage")]
-        let prefix = std::env::var("APPDIR").unwrap_or("".to_string());
-        #[cfg(not(feature = "appimage"))]
-        let prefix = "".to_string();
-        #[cfg(feature = "flatpak")]
-        let dir = "/app";
-        #[cfg(not(feature = "flatpak"))]
-        let dir = "/usr";
-        sciter::set_library(&(prefix + dir + "/lib/rustdesk/libsciter-gtk.so")).ok();
+        let app_dir = std::env::var("APPDIR").unwrap_or("".to_string());
+        let mut so_path = "/usr/share/rustdesk/libsciter-gtk.so".to_owned();
+        for (prefix, dir) in [
+            ("", "/usr"),
+            ("", "/app"),
+            (&app_dir, "/usr"),
+            (&app_dir, "/app"),
+        ]
+        .iter()
+        {
+            let path = format!("{prefix}{dir}/share/rustdesk/libsciter-gtk.so");
+            if std::path::Path::new(&path).exists() {
+                so_path = path;
+                break;
+            }
+        }
+        sciter::set_library(&so_path).ok();
     }
     #[cfg(windows)]
     // Check if there is a sciter.dll nearby.
@@ -79,6 +87,8 @@ pub fn start(args: &mut [String]) {
     frame.set_title(&crate::get_app_name());
     #[cfg(target_os = "macos")]
     crate::platform::delegate::make_menubar(frame.get_host(), args.is_empty());
+    #[cfg(windows)]
+    crate::platform::try_set_window_foreground(frame.get_hwnd() as _);
     let page;
     if args.len() > 1 && args[0] == "--play" {
         args[0] = "--connect".to_owned();
@@ -108,6 +118,11 @@ pub fn start(args: &mut [String]) {
             Box::new(cm::SciterConnectionManager::new())
         });
         page = "cm.html";
+        *cm::HIDE_CM.lock().unwrap() = crate::ipc::get_config("hide_cm")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            == "true";
     } else if (args[0] == "--connect"
         || args[0] == "--file-transfer"
         || args[0] == "--port-forward"
@@ -136,7 +151,7 @@ pub fn start(args: &mut [String]) {
         frame.register_behavior("native-remote", move || {
             let handler =
                 remote::SciterSession::new(cmd.clone(), id.clone(), pass.clone(), args.clone());
-            #[cfg(not(any(feature = "flutter", feature = "cli")))]
+            #[cfg(not(feature = "flutter"))]
             {
                 *CUR_SESSION.lock().unwrap() = Some(handler.inner());
             }
@@ -168,6 +183,13 @@ pub fn start(args: &mut [String]) {
             .unwrap_or("".to_owned()),
         page
     ));
+    let hide_cm = *cm::HIDE_CM.lock().unwrap();
+    if !args.is_empty() && args[0] == "--cm" && hide_cm {
+        // run_app calls expand(show) + run_loop, we use collapse(hide) + run_loop instead to create a hidden window
+        frame.collapse(true);
+        frame.run_loop();
+        return;
+    }
     frame.run_app();
 }
 
@@ -190,12 +212,16 @@ impl UI {
         update_temporary_password()
     }
 
-    fn permanent_password(&self) -> String {
-        permanent_password()
+    fn set_permanent_password(&self, password: String) {
+        let _ = set_permanent_password_with_result(password);
     }
 
-    fn set_permanent_password(&self, password: String) {
-        set_permanent_password(password);
+    fn is_local_permanent_password_set(&self) -> bool {
+        is_local_permanent_password_set()
+    }
+
+    fn is_permanent_password_set(&self) -> bool {
+        is_permanent_password_set()
     }
 
     fn get_remote_id(&mut self) -> String {
@@ -262,6 +288,34 @@ impl UI {
         crate::using_public_server()
     }
 
+    fn is_incoming_only(&self) -> bool {
+        hbb_common::config::is_incoming_only()
+    }
+
+    pub fn is_outgoing_only(&self) -> bool {
+        hbb_common::config::is_outgoing_only()
+    }
+
+    pub fn is_custom_client(&self) -> bool {
+        crate::common::is_custom_client()
+    }
+
+    pub fn is_disable_settings(&self) -> bool {
+        hbb_common::config::is_disable_settings()
+    }
+
+    pub fn is_disable_account(&self) -> bool {
+        hbb_common::config::is_disable_account()
+    }
+
+    pub fn is_disable_installation(&self) -> bool {
+        hbb_common::config::is_disable_installation()
+    }
+
+    pub fn is_disable_ab(&self) -> bool {
+        hbb_common::config::is_disable_ab()
+    }
+
     fn get_options(&self) -> Value {
         let hashmap: HashMap<String, String> =
             serde_json::from_str(&get_options()).unwrap_or_default();
@@ -272,8 +326,8 @@ impl UI {
         m
     }
 
-    fn test_if_valid_server(&self, host: String) -> String {
-        test_if_valid_server(host)
+    fn test_if_valid_server(&self, host: String, test_with_proxy: bool) -> String {
+        test_if_valid_server(host, test_with_proxy)
     }
 
     fn get_sound_inputs(&self) -> Value {
@@ -302,6 +356,10 @@ impl UI {
         install_path()
     }
 
+    fn install_options(&self) -> String {
+        install_options()
+    }
+
     fn get_socks(&self) -> Value {
         Value::from_iter(get_socks())
     }
@@ -312,6 +370,11 @@ impl UI {
 
     fn is_installed(&self) -> bool {
         is_installed()
+    }
+
+    fn get_supported_privacy_mode_impls(&self) -> String {
+        serde_json::to_string(&crate::privacy_mode::get_supported_privacy_mode_impl())
+            .unwrap_or_default()
     }
 
     fn is_root(&self) -> bool {
@@ -548,6 +611,10 @@ impl UI {
         change_id_shared(id, old_id);
     }
 
+    fn http_request(&self, url: String, method: String, body: Option<String>, header: String) {
+        http_request(url, method, body, header)
+    }
+
     fn post_request(&self, url: String, body: String, header: String) {
         post_request(url, body, header)
     }
@@ -558,6 +625,10 @@ impl UI {
 
     fn get_async_job_status(&self) -> String {
         get_async_job_status()
+    }
+
+    fn get_http_status(&self, url: String) -> Option<String> {
+        get_async_http_status(url)
     }
 
     fn t(&self, name: String) -> String {
@@ -584,8 +655,8 @@ impl UI {
         get_langs()
     }
 
-    fn default_video_save_directory(&self) -> String {
-        default_video_save_directory()
+    fn video_save_directory(&self, root: bool) -> String {
+        video_save_directory(root)
     }
 
     fn handle_relay_id(&self, id: String) -> String {
@@ -612,6 +683,10 @@ impl UI {
         verify2fa(code)
     }
 
+    fn verify_login(&self, raw: String, id: String) -> bool {
+        crate::verify_login(&raw, &id)
+    }
+
     fn generate_2fa_img_src(&self, data: String) -> String {
         let v = qrcode_generator::to_png_to_vec(data, qrcode_generator::QrCodeEcc::Low, 128)
             .unwrap_or_default();
@@ -621,6 +696,27 @@ impl UI {
         );
         format!("data:image/png;base64,{s}")
     }
+
+    pub fn check_hwcodec(&self) {
+        check_hwcodec()
+    }
+
+    fn is_option_fixed(&self, key: String) -> bool {
+        crate::ui_interface::is_option_fixed(&key)
+    }
+
+    fn get_builtin_option(&self, key: String) -> String {
+        crate::ui_interface::get_builtin_option(&key)
+    }
+
+    fn is_remote_modify_enabled_by_control_permissions(&self) -> String {
+        match crate::ui_interface::is_remote_modify_enabled_by_control_permissions() {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "",
+        }
+        .to_string()
+    }
 }
 
 impl sciter::EventHandler for UI {
@@ -629,11 +725,19 @@ impl sciter::EventHandler for UI {
         fn get_api_server();
         fn is_xfce();
         fn using_public_server();
+        fn is_custom_client();
+        fn is_outgoing_only();
+        fn is_incoming_only();
+        fn is_disable_settings();
+        fn is_disable_account();
+        fn is_disable_installation();
+        fn is_disable_ab();
         fn get_id();
         fn temporary_password();
         fn update_temporary_password();
-        fn permanent_password();
         fn set_permanent_password(String);
+        fn is_local_permanent_password_set();
+        fn is_permanent_password_set();
         fn get_remote_id();
         fn set_remote_id(String);
         fn closing(i32, i32, i32, i32);
@@ -653,6 +757,7 @@ impl sciter::EventHandler for UI {
         fn get_icon();
         fn install_me(String, String);
         fn is_installed();
+        fn get_supported_privacy_mode_impls();
         fn is_root();
         fn is_release();
         fn set_socks(String, String, String);
@@ -661,6 +766,7 @@ impl sciter::EventHandler for UI {
         fn set_share_rdp(bool);
         fn is_installed_lower_version();
         fn install_path();
+        fn install_options();
         fn goto_install();
         fn is_process_trusted(bool);
         fn is_can_screen_recording(bool);
@@ -677,7 +783,7 @@ impl sciter::EventHandler for UI {
         fn forget_password(String);
         fn set_peer_option(String, String, String);
         fn get_license();
-        fn test_if_valid_server(String);
+        fn test_if_valid_server(String, bool);
         fn get_sound_inputs();
         fn set_options(Value);
         fn set_option(String, String);
@@ -703,7 +809,7 @@ impl sciter::EventHandler for UI {
         fn has_hwcodec();
         fn has_vram();
         fn get_langs();
-        fn default_video_save_directory();
+        fn video_save_directory(bool);
         fn handle_relay_id(String);
         fn get_login_device_info();
         fn support_remove_wallpaper();
@@ -711,6 +817,11 @@ impl sciter::EventHandler for UI {
         fn generate2fa();
         fn generate_2fa_img_src(String);
         fn verify2fa(String);
+        fn check_hwcodec();
+        fn verify_login(String, String);
+        fn is_option_fixed(String);
+        fn get_builtin_option(String);
+        fn is_remote_modify_enabled_by_control_permissions();
     }
 }
 

@@ -6,8 +6,10 @@
 
 		<Property Id="AddRemovePropertiesFile" Value="1" />
 
-		<!--STOP_SERVICE is set to 'Y'. Because the cofig value may be empty or 'Y'-->
+		<!--STOP_SERVICE is set to 'Y'. Because the config value may be empty or 'Y'-->
 		<Property Id="STOP_SERVICE" Value="&apos;Y&apos;" />
+
+		<Property Id="LAUNCH_TRAY_APP" Value="Y" />
 
 		<!--
 		Support entries shown when clicking "Click here for support information"
@@ -25,8 +27,13 @@
 		<!--$ArpStart$-->
 		<!--$ArpEnd$-->
 
-		<Property Id="RUSTDESK_WINDOWS_INSTALLER">
-			<RegistrySearch Id="RustDeskWindowsInstallerFolderSearch" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\$(var.Product)" Name="WindowsInstaller" Type="raw" />
+		<SetProperty Action="SetArpInstallLocation" Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER_INNER]" After="CostFinalize" Sequence="execute" />
+
+		<!--$CustomClientPropsStart$-->
+		<!--$CustomClientPropsEnd$-->
+
+		<Property Id="APP_WINDOWS_INSTALLER" Secure="yes">
+			<RegistrySearch Id="AppWindowsInstallerFolderSearch" Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\$(var.Product)" Name="WindowsInstaller" Type="raw" />
 		</Property>
 	</Fragment>
 </Wix>

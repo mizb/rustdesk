@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hbb/common/widgets/audio_input.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
@@ -21,6 +22,14 @@ import '../../models/file_model.dart';
 import '../../models/platform_model.dart';
 import '../../models/server_model.dart';
 
+/// Set only by this window's own close control, and only once the user has confirmed. Any other
+/// way the window can go - a session logout closing every window, the window manager, a native
+/// title-bar button this app does not draw - leaves it false, which is the honest answer:
+/// nothing in that close says who asked for it. It lives at file scope because the control that
+/// sets it (`ConnectionManagerState`) and the handler that reads it (`_DesktopServerPageState`)
+/// are different widgets.
+bool _cmClosedByOperator = false;
+
 class DesktopServerPage extends StatefulWidget {
   const DesktopServerPage({Key? key}) : super(key: key);
 
@@ -31,14 +40,18 @@ class DesktopServerPage extends StatefulWidget {
 class _DesktopServerPageState extends State<DesktopServerPage>
     with WindowListener, AutomaticKeepAliveClientMixin {
   final tabController = gFFI.serverModel.tabController;
-  @override
-  void initState() {
+
+  _DesktopServerPageState() {
     gFFI.ffiModel.updateEventListener(gFFI.sessionId, "");
-    windowManager.addListener(this);
-    Get.put(tabController);
+    Get.put<DesktopTabController>(tabController);
     tabController.onRemoved = (_, id) {
       onRemoveId(id);
     };
+  }
+
+  @override
+  void initState() {
+    windowManager.addListener(this);
     super.initState();
   }
 
@@ -50,7 +63,10 @@ class _DesktopServerPageState extends State<DesktopServerPage>
 
   @override
   void onWindowClose() {
-    Future.wait([gFFI.serverModel.closeAll(), gFFI.close()]).then((_) {
+    // Other platforms keep the old behaviour exactly: the ambiguity this guards against is a
+    // Linux session logout, which closes every window in the session.
+    final byOperator = _cmClosedByOperator || !isLinux;
+    Future.wait([gFFI.serverModel.closeAll(byOperator: byOperator), gFFI.close()]).then((_) {
       if (isMacOS) {
         RdPlatformChannel.instance.terminate();
       } else {
@@ -76,14 +92,22 @@ class _DesktopServerPageState extends State<DesktopServerPage>
         ChangeNotifierProvider.value(value: gFFI.chatModel),
       ],
       child: Consumer<ServerModel>(
-        builder: (context, serverModel, child) => Container(
-          decoration: BoxDecoration(
-              border: Border.all(color: MyTheme.color(context).border!)),
-          child: Scaffold(
-            backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        builder: (context, serverModel, child) {
+          final body = Scaffold(
+            backgroundColor: Theme.of(context).colorScheme.background,
             body: ConnectionManager(),
-          ),
-        ),
+          );
+          return isLinux
+              ? buildVirtualWindowFrame(context, body)
+              : workaroundWindowBorder(
+                  context,
+                  Container(
+                    decoration: BoxDecoration(
+                        border:
+                            Border.all(color: MyTheme.color(context).border!)),
+                    child: body,
+                  ));
+        },
       ),
     );
   }
@@ -97,10 +121,12 @@ class ConnectionManager extends StatefulWidget {
   State<StatefulWidget> createState() => ConnectionManagerState();
 }
 
-class ConnectionManagerState extends State<ConnectionManager> {
-  @override
-  void initState() {
-    gFFI.serverModel.updateClientState();
+class ConnectionManagerState extends State<ConnectionManager>
+    with WidgetsBindingObserver {
+  final RxBool _controlPageBlock = false.obs;
+  final RxBool _sidePageBlock = false.obs;
+
+  ConnectionManagerState() {
     gFFI.serverModel.tabController.onSelected = (client_id_str) {
       final client_id = int.tryParse(client_id_str);
       if (client_id != null) {
@@ -109,7 +135,7 @@ class ConnectionManagerState extends State<ConnectionManager> {
         if (client != null) {
           gFFI.chatModel.changeCurrentKey(MessageKey(client.peerId, client.id));
           if (client.unreadChatMessageCount.value > 0) {
-            Future.delayed(Duration.zero, () {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
               client.unreadChatMessageCount.value = 0;
               gFFI.chatModel.showChatPage(MessageKey(client.peerId, client.id));
             });
@@ -120,7 +146,30 @@ class ConnectionManagerState extends State<ConnectionManager> {
       }
     };
     gFFI.chatModel.isConnManager = true;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      if (!allowRemoteCMModification()) {
+        shouldBeBlocked(_controlPageBlock, null);
+        shouldBeBlocked(_sidePageBlock, null);
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    gFFI.serverModel.updateClientState();
+    WidgetsBinding.instance.addObserver(this);
     super.initState();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   @override
@@ -157,9 +206,7 @@ class ConnectionManagerState extends State<ConnectionManager> {
               controller: serverModel.tabController,
               selectedBorderColor: MyTheme.accent,
               maxLabelWidth: 100,
-              tail: buildScrollJumper(),
-              selectedTabBackgroundColor:
-                  Theme.of(context).hintColor.withOpacity(0),
+              tail: null, //buildScrollJumper(),
               tabBuilder: (key, icon, label, themeConf) {
                 final client = serverModel.clients
                     .firstWhereOrNull((client) => client.id.toString() == key);
@@ -194,27 +241,35 @@ class ConnectionManagerState extends State<ConnectionManager> {
                           borderWidth;
                   final realChatPageWidth =
                       constrains.maxWidth - realClosedWidth;
-                  return Row(children: [
+                  final row = Row(children: [
                     if (constrains.maxWidth >
                         kConnectionManagerWindowSizeClosedChat.width)
                       Consumer<ChatModel>(
                           builder: (_, model, child) => SizedBox(
                                 width: realChatPageWidth,
-                                child: buildRemoteBlock(
-                                  child: Container(
-                                      decoration: BoxDecoration(
-                                          border: Border(
-                                              right: BorderSide(
-                                                  color: Theme.of(context)
-                                                      .dividerColor))),
-                                      child: buildSidePage()),
-                                ),
+                                child: allowRemoteCMModification()
+                                    ? buildSidePage()
+                                    : buildRemoteBlock(
+                                        child: buildSidePage(),
+                                        block: _sidePageBlock,
+                                        mask: true),
                               )),
                     SizedBox(
                         width: realClosedWidth,
-                        child:
-                            SizedBox(width: realClosedWidth, child: pageView)),
+                        child: SizedBox(
+                            width: realClosedWidth,
+                            child: allowRemoteCMModification()
+                                ? pageView
+                                : buildRemoteBlock(
+                                    child: _buildKeyEventBlock(pageView),
+                                    block: _controlPageBlock,
+                                    mask: false,
+                                  ))),
                   ]);
+                  return Container(
+                    color: Theme.of(context).scaffoldBackgroundColor,
+                    child: row,
+                  );
                 },
               ),
             ),
@@ -232,6 +287,10 @@ class ConnectionManagerState extends State<ConnectionManager> {
     } else {
       return ChatPage(type: ChatPageType.desktopCM);
     }
+  }
+
+  Widget _buildKeyEventBlock(Widget child) {
+    return ExcludeFocus(child: child, excluding: true);
   }
 
   Widget buildTitleBar() {
@@ -279,17 +338,21 @@ class ConnectionManagerState extends State<ConnectionManager> {
     var tabController = gFFI.serverModel.tabController;
     final connLength = tabController.length;
     if (connLength <= 1) {
+      _cmClosedByOperator = true;
       windowManager.close();
       return true;
     } else {
-      final opt = "enable-confirm-closing-tabs";
       final bool res;
-      if (!option2bool(opt, bind.mainGetLocalOption(key: opt))) {
+      if (!option2bool(kOptionEnableConfirmClosingTabs,
+          bind.mainGetLocalOption(key: kOptionEnableConfirmClosingTabs))) {
         res = true;
       } else {
         res = await closeConfirmDialog();
       }
       if (res) {
+        // After the dialog, never before it: an external close while it is open must not
+        // inherit an intent the user had not expressed yet.
+        _cmClosedByOperator = true;
         windowManager.close();
       }
       return res;
@@ -305,7 +368,10 @@ Widget buildConnectionCard(Client client) {
       key: ValueKey(client.id),
       children: [
         _CmHeader(client: client),
-        client.type_() != ClientType.remote || client.disconnected
+        client.type_() == ClientType.file ||
+                client.type_() == ClientType.portForward ||
+                client.type_() == ClientType.terminal ||
+                client.disconnected
             ? Offstage()
             : _PrivilegeBoard(client: client),
         Expanded(
@@ -374,7 +440,10 @@ class _CmHeaderState extends State<_CmHeader>
         _time.value = _time.value + 1;
       }
     });
-    gFFI.serverModel.tabController.onSelected?.call(client.id.toString());
+    // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      gFFI.serverModel.tabController.onSelected?.call(client.id.toString());
+    });
   }
 
   @override
@@ -408,23 +477,7 @@ class _CmHeaderState extends State<_CmHeader>
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 70,
-            height: 70,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: str2color(client.name),
-              borderRadius: BorderRadius.circular(15.0),
-            ),
-            child: Text(
-              client.name[0],
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-                fontSize: 55,
-              ),
-            ),
-          ).marginOnly(right: 10.0),
+          _buildClientAvatar().marginOnly(right: 10.0),
           Expanded(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.start,
@@ -446,7 +499,36 @@ class _CmHeaderState extends State<_CmHeader>
                     "(${client.peerId})",
                     style: TextStyle(color: Colors.white, fontSize: 14),
                   ),
-                ).marginOnly(bottom: 10.0),
+                ),
+                if (client.type_() == ClientType.terminal)
+                  FittedBox(
+                    child: Text(
+                      translate("Terminal"),
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                if (client.type_() == ClientType.file)
+                  FittedBox(
+                    child: Text(
+                      translate("Transfer file"),
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                if (client.type_() == ClientType.camera)
+                  FittedBox(
+                    child: Text(
+                      translate("View camera"),
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                if (client.portForward.isNotEmpty)
+                  FittedBox(
+                    child: Text(
+                      "Port Forward: ${client.portForward}",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ),
+                SizedBox(height: 10.0),
                 FittedBox(
                     child: Row(
                   children: [
@@ -475,7 +557,8 @@ class _CmHeaderState extends State<_CmHeader>
           Offstage(
             offstage: !client.authorized ||
                 (client.type_() != ClientType.remote &&
-                    client.type_() != ClientType.file),
+                    client.type_() != ClientType.file &&
+                    client.type_() != ClientType.camera),
             child: IconButton(
               onPressed: () => checkClickTime(client.id, () {
                 if (client.type_() == ClientType.file) {
@@ -498,6 +581,36 @@ class _CmHeaderState extends State<_CmHeader>
 
   @override
   bool get wantKeepAlive => true;
+
+  Widget _buildClientAvatar() {
+    return buildAvatarWidget(
+          avatar: client.avatar,
+          size: 70,
+          borderRadius: 15,
+          fallback: _buildInitialAvatar(),
+        ) ??
+        _buildInitialAvatar();
+  }
+
+  Widget _buildInitialAvatar() {
+    return Container(
+      width: 70,
+      height: 70,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: str2color(client.name),
+        borderRadius: BorderRadius.circular(15.0),
+      ),
+      child: Text(
+        client.name.isNotEmpty ? client.name[0] : '?',
+        style: TextStyle(
+          fontWeight: FontWeight.bold,
+          color: Colors.white,
+          fontSize: 55,
+        ),
+      ),
+    );
+  }
 }
 
 class _PrivilegeBoard extends StatefulWidget {
@@ -512,19 +625,24 @@ class _PrivilegeBoard extends StatefulWidget {
 class _PrivilegeBoardState extends State<_PrivilegeBoard> {
   late final client = widget.client;
   Widget buildPermissionIcon(bool enabled, IconData iconData,
-      Function(bool)? onTap, String tooltipText) {
+      Function(bool)? onTap, String tooltipText,
+      {required bool canModify}) {
     return Tooltip(
       message: "$tooltipText: ${enabled ? "ON" : "OFF"}",
       waitDuration: Duration.zero,
       child: Container(
         decoration: BoxDecoration(
-          color: enabled ? MyTheme.accent : Colors.grey[700],
+          color: enabled
+              ? (canModify ? MyTheme.accent : MyTheme.accent.withOpacity(0.6))
+              : Colors.grey[700],
           borderRadius: BorderRadius.circular(10.0),
         ),
         padding: EdgeInsets.all(8.0),
         child: InkWell(
-          onTap: () =>
-              checkClickTime(widget.client.id, () => onTap?.call(!enabled)),
+          onTap: canModify
+              ? () =>
+                  checkClickTime(widget.client.id, () => onTap?.call(!enabled))
+              : null,
           child: Column(
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
@@ -545,6 +663,9 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
   Widget build(BuildContext context) {
     final crossAxisCount = 4;
     final spacing = 10.0;
+    final canModifyPermission =
+        bind.mainGetBuildinOption(key: kOptionEnablePermChangeInAcceptWindow) !=
+            'N';
     return Container(
       width: double.infinity,
       height: 160.0,
@@ -576,96 +697,164 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
               padding: EdgeInsets.symmetric(horizontal: spacing),
               mainAxisSpacing: spacing,
               crossAxisSpacing: spacing,
-              children: [
-                buildPermissionIcon(
-                  client.keyboard,
-                  Icons.keyboard,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "keyboard", enabled: enabled);
-                    setState(() {
-                      client.keyboard = enabled;
-                    });
-                  },
-                  translate('Enable keyboard/mouse'),
-                ),
-                buildPermissionIcon(
-                  client.clipboard,
-                  Icons.assignment_rounded,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "clipboard", enabled: enabled);
-                    setState(() {
-                      client.clipboard = enabled;
-                    });
-                  },
-                  translate('Enable clipboard'),
-                ),
-                buildPermissionIcon(
-                  client.audio,
-                  Icons.volume_up_rounded,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "audio", enabled: enabled);
-                    setState(() {
-                      client.audio = enabled;
-                    });
-                  },
-                  translate('Enable audio'),
-                ),
-                buildPermissionIcon(
-                  client.file,
-                  Icons.upload_file_rounded,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "file", enabled: enabled);
-                    setState(() {
-                      client.file = enabled;
-                    });
-                  },
-                  translate('Enable file copy and paste'),
-                ),
-                buildPermissionIcon(
-                  client.restart,
-                  Icons.restart_alt_rounded,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "restart", enabled: enabled);
-                    setState(() {
-                      client.restart = enabled;
-                    });
-                  },
-                  translate('Enable remote restart'),
-                ),
-                buildPermissionIcon(
-                  client.recording,
-                  Icons.videocam_rounded,
-                  (enabled) {
-                    bind.cmSwitchPermission(
-                        connId: client.id, name: "recording", enabled: enabled);
-                    setState(() {
-                      client.recording = enabled;
-                    });
-                  },
-                  translate('Enable recording session'),
-                ),
-                // only windows support block input
-                if (isWindows)
-                  buildPermissionIcon(
-                    client.blockInput,
-                    Icons.block,
-                    (enabled) {
-                      bind.cmSwitchPermission(
-                          connId: client.id,
-                          name: "block_input",
-                          enabled: enabled);
-                      setState(() {
-                        client.blockInput = enabled;
-                      });
-                    },
-                    translate('Enable blocking user input'),
-                  )
-              ],
+              children: client.type_() == ClientType.camera
+                  ? [
+                      buildPermissionIcon(
+                        client.audio,
+                        Icons.volume_up_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "audio",
+                              enabled: enabled);
+                          setState(() {
+                            client.audio = enabled;
+                          });
+                        },
+                        translate('Enable audio'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.recording,
+                        Icons.videocam_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "recording",
+                              enabled: enabled);
+                          setState(() {
+                            client.recording = enabled;
+                          });
+                        },
+                        translate('Enable recording session'),
+                        canModify: canModifyPermission,
+                      ),
+                    ]
+                  : [
+                      buildPermissionIcon(
+                        client.keyboard,
+                        Icons.keyboard,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "keyboard",
+                              enabled: enabled);
+                          setState(() {
+                            client.keyboard = enabled;
+                          });
+                        },
+                        translate('Enable keyboard/mouse'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.clipboard,
+                        Icons.assignment_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "clipboard",
+                              enabled: enabled);
+                          setState(() {
+                            client.clipboard = enabled;
+                          });
+                        },
+                        translate('Enable clipboard'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.audio,
+                        Icons.volume_up_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "audio",
+                              enabled: enabled);
+                          setState(() {
+                            client.audio = enabled;
+                          });
+                        },
+                        translate('Enable audio'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.file,
+                        Icons.upload_file_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "file",
+                              enabled: enabled);
+                          setState(() {
+                            client.file = enabled;
+                          });
+                        },
+                        translate('Enable file copy and paste'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.restart,
+                        Icons.restart_alt_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "restart",
+                              enabled: enabled);
+                          setState(() {
+                            client.restart = enabled;
+                          });
+                        },
+                        translate('Enable remote restart'),
+                        canModify: canModifyPermission,
+                      ),
+                      buildPermissionIcon(
+                        client.recording,
+                        Icons.videocam_rounded,
+                        (enabled) {
+                          bind.cmSwitchPermission(
+                              connId: client.id,
+                              name: "recording",
+                              enabled: enabled);
+                          setState(() {
+                            client.recording = enabled;
+                          });
+                        },
+                        translate('Enable recording session'),
+                        canModify: canModifyPermission,
+                      ),
+                      // only windows support block input
+                      if (isWindows)
+                        buildPermissionIcon(
+                          client.blockInput,
+                          Icons.block,
+                          (enabled) {
+                            bind.cmSwitchPermission(
+                                connId: client.id,
+                                name: "block_input",
+                                enabled: enabled);
+                            setState(() {
+                              client.blockInput = enabled;
+                            });
+                          },
+                          translate('Enable blocking user input'),
+                          canModify: canModifyPermission,
+                        ),
+                      if (bind.mainSupportedPrivacyModeImpls() != '[]')
+                        buildPermissionIcon(
+                          client.privacyMode,
+                          Icons.visibility_off,
+                          (enabled) {
+                            bind.cmSwitchPermission(
+                                connId: client.id,
+                                name: "privacy_mode",
+                                enabled: enabled);
+                            setState(() {
+                              client.privacyMode = enabled;
+                            });
+                          },
+                          translate('Enable privacy mode'),
+                          canModify: canModifyPermission,
+                        )
+                    ],
             ),
           ),
         ],
@@ -701,17 +890,88 @@ class _CmControlPanel extends StatelessWidget {
       children: [
         Offstage(
           offstage: !client.inVoiceCall,
-          child: buildButton(
-            context,
-            color: Colors.red,
-            onClick: () => closeVoiceCall(),
-            icon: Icon(
-              Icons.call_end_rounded,
-              color: Colors.white,
-              size: 14,
-            ),
-            text: "Stop voice call",
-            textColor: Colors.white,
+          child: Row(
+            children: [
+              Expanded(
+                child: buildButton(context,
+                    color: MyTheme.accent,
+                    onClick: null, onTapDown: (details) async {
+                  final devicesInfo =
+                      await AudioInput.getDevicesInfo(true, true);
+                  List<String> devices = devicesInfo['devices'] as List<String>;
+                  if (devices.isEmpty) {
+                    msgBox(
+                      gFFI.sessionId,
+                      'custom-nocancel-info',
+                      'Prompt',
+                      'no_audio_input_device_tip',
+                      '',
+                      gFFI.dialogManager,
+                    );
+                    return;
+                  }
+
+                  String currentDevice = devicesInfo['current'] as String;
+                  final x = details.globalPosition.dx;
+                  final y = details.globalPosition.dy;
+                  final position = RelativeRect.fromLTRB(x, y, x, y);
+                  showMenu(
+                    context: context,
+                    position: position,
+                    items: devices
+                        .map((d) => PopupMenuItem<String>(
+                              value: d,
+                              height: 18,
+                              padding: EdgeInsets.zero,
+                              onTap: () => AudioInput.setDevice(d, true, true),
+                              child: IgnorePointer(
+                                  child: RadioMenuButton(
+                                value: d,
+                                groupValue: currentDevice,
+                                onChanged: (v) {
+                                  if (v != null)
+                                    AudioInput.setDevice(v, true, true);
+                                },
+                                child: Container(
+                                  child: Text(
+                                    d,
+                                    overflow: TextOverflow.ellipsis,
+                                    maxLines: 1,
+                                  ),
+                                  constraints: BoxConstraints(
+                                      maxWidth:
+                                          kConnectionManagerWindowSizeClosedChat
+                                                  .width -
+                                              80),
+                                ),
+                              )),
+                            ))
+                        .toList(),
+                  );
+                },
+                    icon: Icon(
+                      Icons.call_rounded,
+                      color: Colors.white,
+                      size: 14,
+                    ),
+                    text: "Audio input",
+                    textColor: Colors.white),
+              ),
+              Expanded(
+                child: buildButton(
+                  context,
+                  color: Colors.red,
+                  onClick: () => closeVoiceCall(),
+                  icon: Icon(
+                    Icons.call_end_rounded,
+                    color: Colors.white,
+                    size: 14,
+                  ),
+                  text: "Stop voice call",
+                  textColor: Colors.white,
+                ),
+              )
+            ],
           ),
         ),
         Offstage(
@@ -813,7 +1073,10 @@ class _CmControlPanel extends StatelessWidget {
     final model = Provider.of<ServerModel>(context);
     final showElevation = canElevate &&
         model.showElevation &&
-        client.type_() == ClientType.remote;
+        client.type_() == ClientType.remote &&
+        bind.mainGetBuildinOption(
+                key: kOptionHideElevateButtonInAcceptWindow) !=
+            'Y';
     final showAccept = model.approveMode != 'password';
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
@@ -872,12 +1135,14 @@ class _CmControlPanel extends StatelessWidget {
 
   Widget buildButton(BuildContext context,
       {required Color? color,
-      required Function() onClick,
-      Icon? icon,
+      GestureTapCallback? onClick,
+      Widget? icon,
       BoxBorder? border,
       required String text,
       required Color? textColor,
-      String? tooltip}) {
+      String? tooltip,
+      GestureTapDownCallback? onTapDown}) {
+    assert(!(onClick == null && onTapDown == null));
     Widget textWidget;
     if (icon != null) {
       textWidget = Text(
@@ -901,7 +1166,16 @@ class _CmControlPanel extends StatelessWidget {
           color: color, borderRadius: borderRadius, border: border),
       child: InkWell(
         borderRadius: borderRadius,
-        onTap: () => checkClickTime(client.id, onClick),
+        onTap: () {
+          if (onClick == null) return;
+          checkClickTime(client.id, onClick);
+        },
+        onTapDown: (details) {
+          if (onTapDown == null) return;
+          checkClickTime(client.id, () {
+            onTapDown.call(details);
+          });
+        },
         child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -956,12 +1230,21 @@ class _CmControlPanel extends StatelessWidget {
 }
 
 void checkClickTime(int id, Function() callback) async {
+  if (allowRemoteCMModification()) {
+    callback();
+    return;
+  }
   var clickCallbackTime = DateTime.now().millisecondsSinceEpoch;
   await bind.cmCheckClickTime(connId: id);
   Timer(const Duration(milliseconds: 120), () async {
     var d = clickCallbackTime - await bind.cmGetClickTime();
     if (d > 120) callback();
   });
+}
+
+bool allowRemoteCMModification() {
+  return option2bool(kOptionAllowRemoteCmModification,
+      bind.mainGetLocalOption(key: kOptionAllowRemoteCmModification));
 }
 
 class _FileTransferLogPage extends StatefulWidget {
@@ -1027,6 +1310,16 @@ class __FileTransferLogPageState extends State<_FileTransferLogPage> {
               color: Theme.of(context).tabBarTheme.labelColor,
             ),
             Text(translate('Create Folder'))
+          ],
+        );
+      case CmFileAction.rename:
+        return Column(
+          children: [
+            Icon(
+              Icons.drive_file_move_outlined,
+              color: Theme.of(context).tabBarTheme.labelColor,
+            ),
+            Text(translate('Rename'))
           ],
         );
     }
